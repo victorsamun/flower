@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import datetime
 import logging
 import shelve
 import threading
@@ -44,6 +45,11 @@ class PrometheusMetrics:
         self.prefetch_time = Gauge(
             'flower_task_prefetch_time_seconds',
             "The time the task spent waiting at the celery worker to be executed.",
+            ['worker', 'task']
+        )
+        self.queued_time = Histogram(
+            'flower_task_queued_time',
+            'The time the task spent in queue',
             ['worker', 'task']
         )
         self.number_of_prefetched_tasks = Gauge(
@@ -160,19 +166,33 @@ class EventsState(State):
                 task_name = task.name or ''
             self.metrics.events.labels(worker_name, event_type, task_name).inc()
 
-            runtime = event.get('runtime', 0)
-            if runtime:
-                self.metrics.runtime.labels(worker_name, task_name).observe(runtime)
-
+            task_eta = task.eta
+            task_sent = task.sent
             task_started = task.started
             task_received = task.received
 
-            if event_type == 'task-received' and not task.eta and task_received:
+            runtime = event.get('runtime')
+            if runtime is None and task_started:
+                if event_type == 'task-failed' and task.failed:
+                    runtime = task.failed - task_started
+                elif event_type == 'task-retried' and task.retried:
+                    runtime = task.retried - task_started
+            if runtime is not None:
+                self.metrics.runtime.labels(worker_name, task_name).observe(runtime)
+
+            if event_type == 'task-received' and not task_eta and task_received:
                 self.metrics.number_of_prefetched_tasks.labels(worker_name, task_name).inc()
 
-            if event_type == 'task-started' and not task.eta and task_started and task_received:
-                self.metrics.prefetch_time.labels(worker_name, task_name).set(task_started - task_received)
-                self.metrics.number_of_prefetched_tasks.labels(worker_name, task_name).dec()
+            if event_type == 'task-started' and task_started and task_received:
+                if not task_eta:
+                    self.metrics.prefetch_time.labels(worker_name, task_name).set(task_started - task_received)
+                    self.metrics.number_of_prefetched_tasks.labels(worker_name, task_name).dec()
+                    queued_time = task_started - task_sent if task_sent else None
+                else:
+                    queued_time = task_started - datetime.datetime.fromisoformat(task_eta).timestamp()
+
+                if queued_time:
+                    self.metrics.queued_time.labels(worker_name, task_name).observe(queued_time)
 
             if event_type in ['task-succeeded', 'task-failed'] and not task.eta and task_started and task_received:
                 self.metrics.prefetch_time.labels(worker_name, task_name).set(0)

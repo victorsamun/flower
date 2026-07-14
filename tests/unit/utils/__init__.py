@@ -51,9 +51,13 @@ class HtmlTableParser(HTMLParser):
 def task_succeeded_events(worker, id=None, name=None, runtime=0.1234, retries=0, eta=None):
     id = id or uuid()
     name = name or 'sometask'
-    return [Event('task-received', uuid=id, name=name,
+    return [Event('task-sent', uuid=id, name=name,
                   args='(2, 2)', kwargs="{'foo': 'bar'}",
-                  retries=retries, eta=eta, hostname=worker),
+                  hostname=worker),
+            Event('task-received', uuid=id, name=name,
+                  args='(2, 2)', kwargs="{'foo': 'bar'}",
+                  retries=retries, eta=(eta.isoformat() if eta else None),
+                  hostname=worker),
             Event('task-started', uuid=id, hostname=worker),
             Event('task-succeeded', uuid=id, result='4',
                   runtime=runtime, hostname=worker)]
