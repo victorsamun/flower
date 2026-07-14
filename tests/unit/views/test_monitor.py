@@ -1,6 +1,7 @@
 import re
 import time
 from datetime import datetime, timedelta
+from unittest import mock
 
 from celery.events import Event
 from kombu import uuid
@@ -196,6 +197,24 @@ class PrometheusTests(AsyncHTTPTestCase):
         self.assertTrue(
             f'flower_worker_prefetched_tasks{{task="{task_name}",worker="{worker_name}"}} 1.0' in metrics
         )
+
+    def test_queue_length_metric(self):
+        state = EventsState()
+        self.app.events.state = state
+        self.app.inspector.workers = {
+            'worker1': {
+                'active_queues': [{'name': 'celery'}],
+            }
+        }
+
+        with mock.patch.object(
+            self.app.events.state.metrics,
+            '_fetch_queue_lengths',
+            return_value={'celery': 7},
+        ):
+            metrics = self.get('/metrics').body.decode('utf-8')
+
+        self.assertTrue('flower_queue_length{queue="celery"} 7.0' in metrics)
 
 
 class HealthcheckTests(AsyncHTTPTestCase):

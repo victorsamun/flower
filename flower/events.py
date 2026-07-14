@@ -1,16 +1,21 @@
+import asyncio
 import collections
 import logging
 import shelve
 import threading
 from collections import Counter
 from functools import partial
+from concurrent.futures import ThreadPoolExecutor
 
 from celery.events import EventReceiver
 from celery.events.state import State
 from prometheus_client import Counter as PrometheusCounter
 from prometheus_client import Gauge, Histogram
+from prometheus_client.metrics import MetricWrapperBase
 from tornado.ioloop import PeriodicCallback
 from tornado.options import options
+
+from .utils.broker import Broker
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +32,7 @@ def get_prometheus_metrics():
 
 class PrometheusMetrics:
     def __init__(self):
+        self.app = None
         self.events = PrometheusCounter('flower_events_total', "Number of events", ['worker', 'type', 'task'])
 
         self.runtime = Histogram(
@@ -51,6 +57,82 @@ class PrometheusMetrics:
             "Number of tasks currently executing at a worker",
             ['worker']
         )
+        self.queue_length = Gauge(
+            'flower_queue_length',
+            "Number of messages in a broker queue",
+            ['queue']
+        )
+        self._configure_queue_length_metric()
+
+    def configure_queue_metrics(self, app):
+        self.app = app
+
+    def _configure_queue_length_metric(self):
+        # Gauge.set_function only works on labeled children, so refresh
+        # callbacks for active queues right before samples are collected.
+        def multi_samples():
+            self.queue_length.clear()
+            lengths = self._fetch_queue_lengths()
+            if lengths is not None:
+                for queue_name in self._get_active_queue_names():
+                    self.queue_length.labels(queue_name).set_function(
+                        lambda q=queue_name: float(lengths.get(q, 0))
+                    )
+            return MetricWrapperBase._multi_samples(self.queue_length)
+
+        self.queue_length._multi_samples = multi_samples
+
+    def _get_active_queue_names(self):
+        if self.app is None:
+            return []
+
+        queues = set()
+        for _, info in self.app.workers.items():
+            for queue in info.get('active_queues', []):
+                queues.add(queue['name'])
+
+        if not queues:
+            capp = self.app.capp
+            queues = {capp.conf.task_default_queue} | {
+                q.name for q in capp.conf.task_queues or [] if q.name
+            }
+        return sorted(queues)
+
+    def _fetch_queue_lengths(self):
+        if self.app is None:
+            return None
+
+        try:
+            app = self.app
+            http_api = None
+            if app.transport == 'amqp' and app.options.broker_api:
+                http_api = app.options.broker_api
+
+            with app.capp.connection() as conn:
+                broker = Broker(
+                    conn.as_uri(include_password=True),
+                    http_api=http_api,
+                    broker_options=app.capp.conf.broker_transport_options,
+                    broker_use_ssl=app.capp.conf.broker_use_ssl,
+                )
+                queues = self._run_async(broker.queues(self._get_active_queue_names()))
+
+            return {queue['name']: queue['messages'] for queue in queues or []}
+        except Exception as e:
+            logger.warning("Unable to get queue lengths: '%s'", e)
+            return None
+
+    @staticmethod
+    def _run_async(coro):
+        """Run a coroutine from sync Gauge callbacks (IOLoop may already be running)."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+
+        # Avoid deadlock on the running loop: finish the coroutine in a new loop.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(asyncio.run, coro).result()
 
 
 class EventsState(State):
@@ -144,6 +226,9 @@ class Events(threading.Thread):
 
         self.timer = PeriodicCallback(self.on_enable_events,
                                       self.events_enable_interval)
+
+    def configure_queue_metrics(self, app):
+        get_prometheus_metrics().configure_queue_metrics(app)
 
     def start(self):
         threading.Thread.start(self)
