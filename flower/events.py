@@ -2,7 +2,6 @@ import collections
 import logging
 import shelve
 import threading
-import time
 from collections import Counter
 from functools import partial
 
@@ -169,30 +168,45 @@ class Events(threading.Thread):
             self.save_state()
 
     def run(self):
-        try_interval = 1
+        conf = self.capp.conf
+
+        def on_connection_error(exc, interval):
+            logger.error("Failed to capture events: '%s', "
+                         "trying again in %s seconds.",
+                         exc, interval)
+            logger.debug(exc, exc_info=True)
+
         while True:
             try:
-                try_interval *= 2
+                with self.capp.connection_for_read() as conn:
+                    if conf.broker_connection_retry:
+                        conn.ensure_connection(
+                            on_connection_error,
+                            conf.broker_connection_max_retries,
+                        )
+                    else:
+                        conn.connect()
 
-                with self.capp.connection() as conn:
                     recv = EventReceiver(conn,
                                          handlers={"*": self.on_event},
                                          app=self.capp)
-                    try_interval = 1
                     logger.debug("Capturing events...")
-                    recv.capture(limit=None, timeout=None, wakeup=True)
+                    try:
+                        recv.capture(limit=None, timeout=None, wakeup=True)
+                    except conn.connection_errors + conn.channel_errors as exc:
+                        logger.error("Failed to capture events: '%s', "
+                                     "trying to reconnect...",
+                                     exc)
+                        logger.debug(exc, exc_info=True)
+                        if not conf.broker_connection_retry:
+                            raise
             except (KeyboardInterrupt, SystemExit):
                 try:
                     import _thread as thread
                 except ImportError:
                     import thread
                 thread.interrupt_main()
-            except Exception as e:
-                logger.error("Failed to capture events: '%s', "
-                             "trying again in %s seconds.",
-                             e, try_interval)
-                logger.debug(e, exc_info=True)
-                time.sleep(try_interval)
+                break
 
     def save_state(self):
         logger.debug("Saving state to '%s'...", self.db)
