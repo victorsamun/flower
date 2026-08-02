@@ -1,6 +1,7 @@
 import re
 import time
 from datetime import datetime, timedelta
+from unittest import mock
 
 from celery.events import Event
 from kombu import uuid
@@ -67,6 +68,94 @@ class PrometheusTests(AsyncHTTPTestCase):
 
         self.assertTrue(
             f'flower_task_prefetch_time_seconds{{task="{task_name}",worker="{worker_name}"}} 3.0' in metrics
+        )
+
+    def test_task_queued_time_metric(self):
+        state = EventsState()
+        worker_name = 'worker_hist1'
+        task_name = 'task_hist1'
+        state.get_or_create_worker(worker_name)
+        events = task_succeeded_events(worker=worker_name, name=task_name, id='hist-123')[:-1]
+
+        task_sent = time.time() - 1
+        task_received = time.time()
+        task_started = task_received + 3
+        for i, e in enumerate(events):
+            e['clock'] = i
+            e['local_received'] = time.time()
+            if e['type'] == 'task-sent':
+                e['timestamp'] = task_sent
+            if e['type'] == 'task-received':
+                e['timestamp'] = task_received
+            if e['type'] == 'task-started':
+                e['timestamp'] = task_started
+            state.event(e)
+        self.app.events.state = state
+
+        metrics = self.get('/metrics').body.decode('utf-8')
+
+        self.assertTrue(
+            f'flower_task_queued_time_count{{task="{task_name}",worker="{worker_name}"}} 1.0' in metrics
+        )
+        self.assertTrue(
+            f'flower_task_queued_time_sum{{task="{task_name}",worker="{worker_name}"}} 4.0' in metrics
+        )
+
+    def test_task_queued_time_metric_accumulates_and_is_not_reset_on_success(self):
+        state = EventsState()
+        worker_name = 'worker_hist2'
+        task_name = 'task_hist2'
+        state.get_or_create_worker(worker_name)
+
+        for task_id, delay in (('hist-a', 3), ('hist-b', 5)):
+            events = task_succeeded_events(worker=worker_name, name=task_name, id=task_id)
+            task_sent = time.time() - 1
+            task_received = time.time()
+            task_started = task_received + delay
+            for i, e in enumerate(events):
+                e['clock'] = i
+                e['local_received'] = time.time()
+                if e['type'] == 'task-sent':
+                    e['timestamp'] = task_sent
+                if e['type'] == 'task-received':
+                    e['timestamp'] = task_received
+                if e['type'] == 'task-started':
+                    e['timestamp'] = task_started
+                state.event(e)
+
+        self.app.events.state = state
+        metrics = self.get('/metrics').body.decode('utf-8')
+
+        # Unlike the gauge, the histogram keeps observations after task completion.
+        self.assertTrue(
+            f'flower_task_queued_time_count{{task="{task_name}",worker="{worker_name}"}} 2.0' in metrics
+        )
+        self.assertTrue(
+            f'flower_task_queued_time_sum{{task="{task_name}",worker="{worker_name}"}} 10.0' in metrics
+        )
+
+    def test_task_prefetch_time_hist_metric_does_not_observe_if_task_has_eta(self):
+        state = EventsState()
+        worker_name = 'worker_hist3'
+        task_name = 'task_hist3'
+        state.get_or_create_worker(worker_name)
+        events = [Event('worker-online', hostname=worker_name)]
+        events += task_succeeded_events(
+            worker=worker_name, name=task_name, id='hist-eta', eta=datetime.now() + timedelta(hours=4)
+        )
+        for i, e in enumerate(events):
+            e['clock'] = i
+            e['local_received'] = time.time()
+            state.event(e)
+        self.app.events.state = state
+
+        metrics = self.get('/metrics').body.decode('utf-8')
+
+        self.assertFalse(
+            f'flower_task_prefetch_time_hist_count{{task="{task_name}",worker="{worker_name}"}}' in metrics
+        )
+        self.assertFalse(
+            f'flower_task_prefetch_time_hist_sum{{task="{task_name}",worker="{worker_name}"}}' in metrics
         )
 
     def test_task_prefetch_time_metric_successful_task_resets_metric_to_zero(self):
@@ -196,6 +285,24 @@ class PrometheusTests(AsyncHTTPTestCase):
         self.assertTrue(
             f'flower_worker_prefetched_tasks{{task="{task_name}",worker="{worker_name}"}} 1.0' in metrics
         )
+
+    def test_queue_length_metric(self):
+        state = EventsState()
+        self.app.events.state = state
+        self.app.inspector.workers = {
+            'worker1': {
+                'active_queues': [{'name': 'celery'}],
+            }
+        }
+
+        with mock.patch.object(
+            self.app.events.state.metrics,
+            '_fetch_queue_lengths',
+            return_value={'celery': 7},
+        ):
+            metrics = self.get('/metrics').body.decode('utf-8')
+
+        self.assertTrue('flower_queue_length{queue="celery"} 7.0' in metrics)
 
 
 class HealthcheckTests(AsyncHTTPTestCase):
